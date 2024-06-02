@@ -39,7 +39,6 @@ timer_active = False
 top_up_amount = 0
 top_up_user_id = None
 
-
 class BuyState(StatesGroup):
     amount = State()
 
@@ -61,6 +60,17 @@ class InvestProcess(StatesGroup):
     waiting_for_manual_amount = State()
     waiting_for_direction = State()
     waiting_for_wait_time = State()
+
+class WithdrawProcess(StatesGroup):
+    waiting_for_withdraw_amount = State()
+    waiting_for_card_details = State()
+
+class SellState(StatesGroup):
+    amount = State()
+
+class SellStates(StatesGroup):
+    waiting_for_quantity = State()
+    confirm_sell = State()
 
 crypto_display_names = {
     'bitcoin': 'Bitcoin/USD',
@@ -102,6 +112,31 @@ crypto_wallets = {
 def is_in_top_up_process(user_id):
     global top_up_user_id
     return top_up_user_id == user_id
+
+async def get_crypto_price(crypto, currency):
+    url = f"https://api.coingecko.com/api/v3/simple/price?ids={crypto}&vs_currencies={currency}"
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    logging.info(f"API response: {data}")
+                    
+                    # Добавим вывод данных о цене криптовалюты
+                    logging.info(f"Price data for {crypto} in {currency}: {data.get(crypto)}")
+                    
+                    price = data.get(crypto, {}).get(currency)
+                    if price is None:
+                        logging.error(f"Price for {crypto} in {currency} is not found in the response")
+                        return None
+                    return price
+                else:
+                    logging.error(f"Error fetching crypto price: {response.status} {response.reason}")
+                    return None
+    except Exception as e:
+        logging.error(f"Exception fetching crypto price: {e}")
+        return None
 
 try:
     connection = mysql.connector.connect(
@@ -440,10 +475,51 @@ async def process_top_up_card(call: types.CallbackQuery):
 
 @dp.callback_query_handler(lambda call: call.data == 'withdraw')
 async def process_withdraw(call: types.CallbackQuery):
-    await call.message.answer("""💰Введите сумму вывода:
+    user_id = call.from_user.id
+    user_balance = await get_user_balance(user_id)  # Получаем баланс пользователя
+
+    await call.message.answer(f"""💰Введите сумму вывода:
                               
-У вас на балансе: 0 ₽
-Минимальная сумма вывода: 1000 ₽""")
+У вас на балансе: {user_balance} ₽
+Минимальная сумма вывода: 1000 ₽
+""")
+    await WithdrawProcess.waiting_for_withdraw_amount.set()
+
+@dp.message_handler(state=WithdrawProcess.waiting_for_withdraw_amount)
+async def withdraw_amount_entered(message: types.Message, state: FSMContext):
+    try:
+        amount = int(message.text)
+        user_balance = await get_user_balance(message.from_user.id)
+        
+        if amount < 1000:
+            await message.reply("Минимальная сумма вывода: 1000 ₽. Пожалуйста, введите другую сумму:")
+            return
+        
+        if user_balance < amount:
+            await message.reply("На вашем балансе недостаточно средств. Пожалуйста, введите другую сумму:")
+            return
+
+        await state.update_data(amount=amount)
+        await message.reply("💳 Введите реквизиты на которые поступит вывод средств:\n\n⚠️ Вывод средств возможен только на реквизиты, с которых пополнялся ваш баланс! ⚠️")
+        await WithdrawProcess.waiting_for_card_details.set()
+        
+    except ValueError:
+        await message.reply("Пожалуйста, введите правильную сумму.")
+
+@dp.message_handler(state=WithdrawProcess.waiting_for_card_details)
+async def card_details_entered(message: types.Message, state: FSMContext):
+    card_number = message.text.strip()
+    
+    if len(card_number) != 16 or not card_number.isdigit():
+        await message.reply("Некорректный формат. Введите 16 цифр номера карты.")
+        return
+
+    # Получаем сумму вывода из состояния
+    data = await state.get_data()
+    amount = data.get('amount')
+    
+    await message.reply("Ваша заявка на вывод была успешно создана.\nВывод средств может занимать время от 60 минут до 3х часов. Если деньги не поступили в течение этого времени, обратитесь в Тех.Поддержку.")
+    await state.finish()
 
 @dp.callback_query_handler(lambda call: call.data == 'verification')
 async def process_verification(call: types.CallbackQuery):
@@ -684,7 +760,6 @@ async def process_buy(callback_query: types.CallbackQuery):
     await bot.send_message(chat_id, text=my_text, reply_markup=keyboard)
 
 async def get_user_balance(user_id):
-    # Mock function: Replace with actual logic to get user's balance
     return 50000.0
 
 @dp.callback_query_handler(lambda c: c.data.startswith('buy_'))
@@ -745,17 +820,12 @@ async def process_amount(message: types.Message, state: FSMContext):
 
     await state.finish()
 
-async def get_crypto_price(crypto, currency):
-    url = f'https://api.coingecko.com/api/v3/simple/price?ids={crypto}&vs_currencies={currency}'
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as response:
-            data = await response.json()
-            return data[crypto][currency]
-
-async def get_user_balance(user_id):
-    # Замените эту функцию на реальную реализацию получения баланса пользователя
-    # Например, из базы данных
-    return 10000  # Пример: возвращает 10000 рублей
+# async def get_crypto_price(crypto, currency):
+#     url = f'https://api.coingecko.com/api/v3/simple/price?ids={crypto}&vs_currencies={currency}'
+#     async with aiohttp.ClientSession() as session:
+#         async with session.get(url) as response:
+#             data = await response.json()
+#             return data[crypto][currency]
 
 @dp.callback_query_handler(lambda c: c.data == 'back_to_birje')
 async def process_back_to_birje(callback_query: types.CallbackQuery):
@@ -765,9 +835,7 @@ async def process_back_to_birje(callback_query: types.CallbackQuery):
 async def send_my_birje(message: types.Message):
     my_birje_message = """
 Активы - это финансовые инструменты, которые трейдеры покупают или продают на рынке для получения прибыли.
-
-Это могут быть различные виды финансовых инструментов, включая акции, валюты, сырьевые товары, облигации, опционы и
-другие.
+Это могут быть различные виды финансовых инструментов, включая акции, валюты, сырьевые товары, облигации, опционы и другие.
 
 
 🗄 Активы:
@@ -790,14 +858,11 @@ async def send_my_birje(message: types.Message):
         reply_markup=keyboard
     )
 
-class SellState(StatesGroup):
-    amount = State()
-
 async def get_crypto_balance(user_id, crypto):
     # Замените эту функцию на реальную реализацию получения баланса пользователя
     # Например, из базы данных
     balances = {
-        'bitcoin': 0.5,
+        'bitcoin': 0.000015,
         'ethereum': 10.0,
         'tether': 1000.0,
         'shiba-inu': 1000000.0,
@@ -805,66 +870,157 @@ async def get_crypto_balance(user_id, crypto):
     }
     return balances.get(crypto, 0)
 
-@dp.callback_query_handler(lambda c: c.data.startswith('sell_'))
-async def process_sell_currency(callback_query: types.CallbackQuery, state: FSMContext):
+@dp.callback_query_handler(lambda c: c.data == 'sell')
+async def show_crypto_balances(callback_query: types.CallbackQuery):
     await bot.answer_callback_query(callback_query.id)
     chat_id = callback_query.message.chat.id
-    currency_mapping = {
-        'sell_btc': 'bitcoin',
-        'sell_eth': 'ethereum',
-        'sell_usdt': 'tether',
-        'sell_shib': 'shiba-inu',
-        'sell_atom': 'cosmos'
-    }
-    crypto = currency_mapping[callback_query.data]
-    user_balance = await get_crypto_balance(callback_query.from_user.id, crypto) 
+    user_id = callback_query.from_user.id
 
-    my_text = f"""
-💰 Продажа {crypto.upper()}:
+    btc_balance = await get_crypto_balance(user_id, 'bitcoin')
+    eth_balance = await get_crypto_balance(user_id, 'ethereum')
+    usdt_balance = await get_crypto_balance(user_id, 'tether')
+    shib_balance = await get_crypto_balance(user_id, 'shiba-inu')
+    atom_balance = await get_crypto_balance(user_id, 'cosmos')
 
-Кол-во штук у вас: {user_balance} {crypto.upper()}
-Введите кол-во монет сколько бы вы хотели продать:
+    message_text = f"""
+На данный момент у вас такое количество активов:
+
+🗄 Активы:
+┏ BTC: {btc_balance}
+┣ ETH: {eth_balance}
+┣ USDT: {usdt_balance}
+┣ SHIB: {shib_balance}
+┗ ATOM: {atom_balance}
+
+<blockquote>ВЫБЕРИ МОНЕТУ ДЛЯ ПРОДАЖИ</blockquote>
 """
-    await state.update_data(crypto=crypto, user_balance=user_balance)
-    await SellState.amount.set()
-
-    keyboard = InlineKeyboardMarkup(row_width=1)
+    keyboard = InlineKeyboardMarkup(row_width=3)
+    keyboard.add(
+        InlineKeyboardButton("BTC", callback_data='sell_btc'),
+        InlineKeyboardButton("ETH", callback_data='sell_eth'),
+        InlineKeyboardButton("USDT", callback_data='sell_usdt')
+    )
+    keyboard.row(
+        InlineKeyboardButton("SHIB", callback_data='sell_shib'),
+        InlineKeyboardButton("ATOM", callback_data='sell_atom')
+    )
     keyboard.add(
         InlineKeyboardButton("🔙", callback_data='back_to_birje')
     )
-    await bot.send_message(chat_id, text=my_text, reply_markup=keyboard)
+    await bot.send_message(chat_id, message_text, reply_markup=keyboard, parse_mode=types.ParseMode.HTML)
 
 
-@dp.message_handler(state=SellState.amount)
-async def process_sell_amount(message: types.Message, state: FSMContext):
+@dp.callback_query_handler(lambda c: c.data == 'sell_btc')
+async def process_sell_btc(callback_query: types.CallbackQuery, state: FSMContext):
+    await process_sell_button(callback_query, 'bitcoin', 'BTC', state)
+
+@dp.callback_query_handler(lambda c: c.data == 'sell_eth')
+async def process_sell_eth(callback_query: types.CallbackQuery, state: FSMContext):
+    await process_sell_button(callback_query, 'ethereum', 'ETH', state)
+
+@dp.callback_query_handler(lambda c: c.data == 'sell_usdt')
+async def process_sell_usdt(callback_query: types.CallbackQuery, state: FSMContext):
+    await process_sell_button(callback_query, 'tether', 'USDT', state)
+
+@dp.callback_query_handler(lambda c: c.data == 'sell_shib')
+async def process_sell_shib(callback_query: types.CallbackQuery, state: FSMContext):
+    await process_sell_button(callback_query, 'shiba-inu', 'SHIB', state)
+
+@dp.callback_query_handler(lambda c: c.data == 'sell_atom')
+async def process_sell_atom(callback_query: types.CallbackQuery, state: FSMContext):
+    await process_sell_button(callback_query, 'cosmos', 'ATOM', state)
+
+async def process_sell_button(callback_query: types.CallbackQuery, crypto: str, display_name: str, state: FSMContext):
+    await bot.answer_callback_query(callback_query.id)
+    
+    user_id = callback_query.from_user.id
+    currency = 'usd'
+    crypto_price = await get_crypto_price(crypto, currency)
+    crypto_balance = await get_crypto_balance(user_id, crypto)
+    
+    await state.update_data(crypto=crypto, crypto_price=crypto_price, display_name=display_name, crypto_balance=crypto_balance)
+    
+    message_text = f"""
+Какое количество вы бы хотели продать?
+
+Курс монеты: {crypto_price} {currency}
+Ваш баланс: {crypto_balance} {display_name}
+"""
+    
+    await bot.send_message(callback_query.message.chat.id, message_text)
+    await SellStates.waiting_for_quantity.set()
+
+@dp.message_handler(state=SellStates.waiting_for_quantity)
+async def get_quantity(message: types.Message, state: FSMContext):
     try:
-        amount_to_sell = int(message.text)
+        quantity = float(message.text)
     except ValueError:
-        await message.reply("Пожалуйста, введите числовое значение.")
+        await message.reply("Пожалуйста, введите допустимое количество.")
+        return
+    
+    data = await state.get_data()
+    crypto_balance = data.get('crypto_balance', 0)  
+    display_name = data.get('display_name', 'монеты')  
+    
+    if quantity > crypto_balance:
+        await message.reply(f"У вас нет такого количества {display_name}. Ваш текущий баланс: {crypto_balance} {display_name}.")
+        await state.finish()  # Завершаем состояние
+        keyboard = InlineKeyboardMarkup()
+        keyboard.add(InlineKeyboardButton("Приобрести", callback_data="top_up"))
+        await message.reply("Вы можете пополнить ваш баланс, нажав на кнопку ниже:", reply_markup=keyboard)
         return
 
-    if amount_to_sell <= 0:
-        await message.reply("Введите положительное число.")
-        return
+    crypto_price = data.get('crypto_price', 0)  
+    
+    total_value = quantity * crypto_price
+    
+    message_text = f"""
+    Вы хотите продать {quantity} {display_name}.
+    По текущему курсу {crypto_price} USD, ваша прибыль составит: {total_value:.2f} USD
+    """
+    
+    keyboard = InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        InlineKeyboardButton("Продать", callback_data='confirm_sell'),
+        InlineKeyboardButton("Оставить", callback_data='cancel_sell')
+    )
+    
+    await message.reply(message_text, reply_markup=keyboard)
+    await SellStates.confirm_sell.set()
 
-    user_data = await state.get_data()
-    crypto = user_data['crypto']
-    user_balance = user_data['user_balance']
-    current_price = await get_crypto_price(crypto, 'usd')
 
-    if amount_to_sell > user_balance:
-        await message.reply("Недостаточно монет для продажи.")
-        return
 
-    total_amount = amount_to_sell * current_price
-    await message.reply(f"""
-Текущий курс монеты - {current_price} $
-
-Продав {amount_to_sell} {crypto.upper()} вы получите: {total_amount} $
-""")
-    # Здесь можно добавить логику обновления баланса пользователя после продажи
-
+@dp.callback_query_handler(lambda c: c.data == 'confirm_sell', state=SellStates.confirm_sell)
+async def confirm_sell(callback_query: types.CallbackQuery, state: FSMContext):
+    await bot.answer_callback_query(callback_query.id)
+    await bot.send_message(callback_query.message.chat.id, "Вы успешно продали, подождите минуту.")
     await state.finish()
+
+@dp.callback_query_handler(lambda c: c.data == 'cancel_sell', state=SellStates.confirm_sell)
+async def cancel_sell(callback_query: types.CallbackQuery, state: FSMContext):
+    await bot.answer_callback_query(callback_query.id)
+    await bot.send_message(callback_query.message.chat.id, "Вы ничего не продали, монеты при вас :)")
+    await state.finish()
+
+# async def get_crypto_price(crypto, currency):
+#     url = f"https://api.coingecko.com/api/v3/simple/price?ids={crypto}&vs_currencies={currency}"  # Замените на реальный URL API
+#     headers = {
+#         'Authorization': 'CG-Ghg7AMnQqS1ocERbA9M24RXL'  # Замените на реальный ключ API
+#     }
+    
+#     try:
+#         async with aiohttp.ClientSession() as session:
+#             async with session.get(url, headers=headers) as response:
+#                 if response.status == 200:
+#                     data = await response.json()
+#                     return data['price']
+#                 else:
+#                     logging.error(f"Error fetching crypto price: {response.status} {response.reason}")
+#                     return None
+#     except Exception as e:
+#         logging.error(f"Exception fetching crypto price: {e}")
+#         return None
+
 
 @dp.callback_query_handler(lambda c: c.data == 'number1_next')
 async def process_number1_next(callback_query: types.CallbackQuery, state: FSMContext):
@@ -886,33 +1042,33 @@ async def process_previous_button(callback_query: types.CallbackQuery, state: FS
         await state.update_data(page=current_page - 1)
     await send_my_future(callback_query.message, state)
 
-async def get_crypto_price(crypto_name, currency):
-    global last_api_request_time
-    current_time = asyncio.get_event_loop().time()
-    # Проверяем, прошло ли уже как минимум 1 секунда с момента последнего запроса
-    if current_time - last_api_request_time < 1:
-        # Если прошло меньше секунды, ждем до тех пор, пока не пройдет 1 секунда
-        await asyncio.sleep(1 - (current_time - last_api_request_time))
-    try:
-        url = f'https://api.coingecko.com/api/v3/simple/price?ids={crypto_name}&vs_currencies={currency}'
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    price = data.get(crypto_name, {}).get(currency)
-                    if price is None:
-                        raise ValueError(f"Price for {crypto_name} in {currency} is not found in the response")
-                    logging.info(f"Price for {crypto_name}: {price}")
-                    return price
-                else:
-                    logging.error(f"Failed to fetch price for {crypto_name}. Status code: {response.status}")
-                    return None
-    except Exception as e:
-        logging.error(f"Error getting price for {crypto_name}: {e}")
-        return None
-    finally:
-        # Обновляем время последнего запроса к API
-        last_api_request_time = asyncio.get_event_loop().time()
+# async def get_crypto_price(crypto_name, currency):
+#     global last_api_request_time
+#     current_time = asyncio.get_event_loop().time()
+#     # Проверяем, прошло ли уже как минимум 1 секунда с момента последнего запроса
+#     if current_time - last_api_request_time < 1:
+#         # Если прошло меньше секунды, ждем до тех пор, пока не пройдет 1 секунда
+#         await asyncio.sleep(1 - (current_time - last_api_request_time))
+#     try:
+#         url = f'https://api.coingecko.com/api/v3/simple/price?ids={crypto_name}&vs_currencies={currency}'
+#         async with aiohttp.ClientSession() as session:
+#             async with session.get(url) as response:
+#                 if response.status == 200:
+#                     data = await response.json()
+#                     price = data.get(crypto_name, {}).get(currency)
+#                     if price is None:
+#                         raise ValueError(f"Price for {crypto_name} in {currency} is not found in the response")
+#                     logging.info(f"Price for {crypto_name}: {price}")
+#                     return price
+#                 else:
+#                     logging.error(f"Failed to fetch price for {crypto_name}. Status code: {response.status}")
+#                     return None
+#     except Exception as e:
+#         logging.error(f"Error getting price for {crypto_name}: {e}")
+#         return None
+#     finally:
+#         # Обновляем время последнего запроса к API
+#         last_api_request_time = asyncio.get_event_loop().time()
 
 async def get_user_balance(user_id):
     # Mock function: Replace with actual logic to get user's balance
@@ -1036,37 +1192,6 @@ async def go_back_to_crypto_selection(callback_query: types.CallbackQuery, state
         # Добавьте сюда функцию для отображения второй страницы криптовалют
         pass
 
-async def calculate_potential_winning(amount_rub, current_price_usd, direction, coefficients):
-    usd_to_rub = 70  # Текущий курс доллара к рублю
-    
-    # Переводим сумму ставки в доллары
-    amount_usd = amount_rub / usd_to_rub
-    
-    # Переводим сумму ставки в криптовалюту
-    amount_crypto = amount_usd / current_price_usd
-    
-    # Выбранный коэффициент
-    coefficient = coefficients[direction]
-    
-    # Расчет потенциального выигрыша в криптовалюте
-    potential_winning_crypto = amount_crypto * coefficient
-    
-    # Перевод выигрыша обратно в доллары
-    potential_winning_usd = potential_winning_crypto * current_price_usd
-    
-    # Перевод выигрыша в рубли
-    potential_winning_rub = potential_winning_usd * usd_to_rub
-    
-    return potential_winning_rub
-
-# Функция для генерации случайных коэффициентов
-def generate_random_coefficients():
-    return {
-        'direction_up': round(random.uniform(1.1, 2.0), 2),
-        'direction_no_change': round(random.uniform(5.1, 10.0), 2),
-        'direction_down': round(random.uniform(1.1, 2.0), 2)
-    }
-
 @dp.callback_query_handler(lambda c: c.data.startswith('amount_'), state=InvestProcess.waiting_for_amount)
 async def amount_selected(callback_query: types.CallbackQuery, state: FSMContext):
     logging.info('Amount selected')
@@ -1102,15 +1227,27 @@ async def manual_amount_entered(message: types.Message, state: FSMContext):
 
 async def proceed_to_direction(message, state: FSMContext):
     logging.info('Proceeding to direction')
-    coefficients = generate_random_coefficients()
+    
+    # Генерируем случайные коэффициенты для каждого направления
+    coefficients = {
+        'direction_up': round(random.uniform(1.1, 2.0), 2),
+        'direction_no_change': round(random.uniform(5.1, 10.0), 2),
+        'direction_down': round(random.uniform(1.1, 2.0), 2)
+    }
+    
+    # Сохраняем коэффициенты в состоянии
     await state.update_data(coefficients=coefficients)
     
-    await bot.send_message(message.chat.id, f"""
+    # Формируем текст сообщения с коэффициентами
+    text = f"""
 🔍 Коэффициенты:
 ↗️ Вверх - х{coefficients['direction_up']}
 ⛔️ Не изменится - х{coefficients['direction_no_change']}
 ↘️ Вниз - х{coefficients['direction_down']}
-""")
+"""
+    
+    await message.reply(text)
+    
     keyboard = InlineKeyboardMarkup(row_width=3)
     keyboard.add(
         InlineKeyboardButton("Вверх", callback_data='direction_up'),
@@ -1139,6 +1276,27 @@ async def direction_selected(callback_query: types.CallbackQuery, state: FSMCont
     await callback_query.message.reply("🕰 Выберите время ожидания:", reply_markup=keyboard)
     await InvestProcess.waiting_for_wait_time.set()
 
+async def calculate_potential_winning(amount_rub, current_price_usd, coefficient):
+    # Курсы валют
+    usd_to_rub = 90  # Текущий курс доллара к рублю
+    
+    # Переводим сумму ставки в доллары
+    amount_usd = amount_rub / usd_to_rub
+    
+    # Переводим сумму ставки в криптовалюту
+    amount_crypto = amount_usd / current_price_usd
+    
+    # Расчет потенциального выигрыша в криптовалюте
+    potential_winning_crypto = amount_crypto * coefficient
+    
+    # Перевод выигрыша обратно в доллары
+    potential_winning_usd = potential_winning_crypto * current_price_usd
+    
+    # Перевод выигрыша в рубли
+    potential_winning_rub = potential_winning_usd * usd_to_rub
+    
+    return potential_winning_rub
+
 @dp.callback_query_handler(lambda c: c.data in ['wait_10', 'wait_30', 'wait_60'], state=InvestProcess.waiting_for_wait_time)
 async def wait_time_selected(callback_query: types.CallbackQuery, state: FSMContext):
     logging.info('Wait time selected')
@@ -1146,16 +1304,22 @@ async def wait_time_selected(callback_query: types.CallbackQuery, state: FSMCont
     data = await state.get_data()
     amount = data.get('amount')
     direction = data.get('direction')
+    coefficients = data.get('coefficients')
     crypto_name = data.get('crypto_name', 'Unknown Crypto')
-    current_price = await get_crypto_price(crypto_name)
-    coefficients = data.get('coefficients', {'direction_up': 2, 'direction_no_change': 10, 'direction_down': 2})
+    current_price = data.get('current_price', 'N/A')
     
-    if current_price is None:
+    if current_price == 'N/A':
         await bot.send_message(callback_query.message.chat.id, "Не удалось получить текущую стоимость криптовалюты.")
         return
     
+    # Переводим текущую цену в число
+    current_price_usd = float(current_price)
+    
+    # Получаем коэффициент для выбранного направления
+    coefficient = coefficients[direction]
+    
     # Рассчитываем потенциальный выигрыш
-    potential_winning_rub = await calculate_potential_winning(amount, current_price, direction, coefficients)
+    potential_winning_rub = await calculate_potential_winning(amount, current_price_usd, coefficient)
     
     direction_text = {
         'direction_up': 'Вверх',
@@ -1169,11 +1333,13 @@ async def wait_time_selected(callback_query: types.CallbackQuery, state: FSMCont
 🟣 Сумма ставки: {amount} ₽
 🟣 Прогноз: {direction_text[direction]}
 
-*Изначальная стоимость: {current_price} USD
+*Изначальная стоимость: {current_price_usd} USD
 *Текущая стоимость:  USD
 *Изменение: 8.238 USD
 🟣 Осталось: {wait_time} секунд
 💸 Потенциальный выигрыш: {potential_winning_rub} ₽
+
+Коэффициент: {coefficient}
 """)
 
     await bot.send_sticker(callback_query.message.chat.id, sticker='CAACAgIAAxkBAAKgxWZaES6rPNZMP7AG4qzOBmKH7GGDAAIjAAMoD2oUJ1El54wgpAY1BA')
@@ -1186,6 +1352,7 @@ async def wait_time_selected(callback_query: types.CallbackQuery, state: FSMCont
 ┣ Опцион: {crypto_name}
 ┣ Сумма: {amount}
 ┣ Поставил: {direction_text[direction]}
+┣ Потенциальный выигрыш: {potential_winning_rub}
 ┗ Дать ли возможность выйграть мамонту?
 """
     notify_payload = {
@@ -1310,16 +1477,3 @@ async def main():
 
 if __name__ == '__main__':
     executor.start_polling(dp, skip_updates=True, )
-
-
-
-
-# 💱Tron/USD
-
-# 🟣Сумма ставки: 3500 Р
-# 🟣Прогноз:Вверх
-
-# *Изначальная стоимость: 0.135
-# *Текущая стоимость: 8.373
-# *Изменение: 8.238
-# 🟣Осталось: 10 сек
